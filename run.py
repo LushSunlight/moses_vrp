@@ -22,8 +22,12 @@ from rl4co.utils import RL4COTrainer
 pyrootutils.setup_root(__file__, indicator="run.py", pythonpath=True)
 log = utils.get_pylogger(__name__)
 
-#TODO: please type your personal wandb login key
-wandb.login(key="")
+# Prefer WANDB_API_KEY from environment; fallback to normal wandb login behavior.
+wandb_api_key = os.getenv("WANDB_API_KEY", "").strip()
+if wandb_api_key:
+    wandb.login(key=wandb_api_key)
+else:
+    wandb.login()
 
 
 @utils.task_wrapper
