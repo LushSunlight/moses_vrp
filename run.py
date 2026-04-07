@@ -8,6 +8,7 @@ import hydra
 import lightning as L
 import pyrootutils
 import torch
+import torch.serialization
 import wandb
 import math
 
@@ -17,10 +18,14 @@ from omegaconf import DictConfig, OmegaConf
 import omegaconf
 from rl4co import utils
 from rl4co.utils import RL4COTrainer
+from envs.mtvrp.env import MTVRPEnv
 
 #OmegaConf.register_new_resolver('random', lambda x: str(int(round(np.random.rand(), x)*1e5)))
 pyrootutils.setup_root(__file__, indicator="run.py", pythonpath=True)
 log = utils.get_pylogger(__name__)
+
+# Required for loading old checkpoints under PyTorch 2.6+ weights-only behavior.
+torch.serialization.add_safe_globals([MTVRPEnv])
 
 # Prefer WANDB_API_KEY from environment; fallback to normal wandb login behavior.
 wandb_api_key = os.getenv("WANDB_API_KEY", "").strip()
@@ -86,7 +91,16 @@ def run(cfg: DictConfig) -> Tuple[dict, dict]:
 
     if cfg.get("train"):
         log.info("Starting training!")
-        trainer.fit(model=model, ckpt_path=cfg.get("ckpt_path"))
+        fit_kwargs = {"model": model, "ckpt_path": cfg.get("ckpt_path")}
+        if cfg.get("ckpt_path"):
+            # PyTorch 2.6 defaults to weights_only=True, which can block full checkpoint restore.
+            fit_kwargs["weights_only"] = False
+        try:
+            trainer.fit(**fit_kwargs)
+        except TypeError:
+            # Backward compatibility for Lightning versions without weights_only in fit().
+            fit_kwargs.pop("weights_only", None)
+            trainer.fit(**fit_kwargs)
 
         train_metrics = trainer.callback_metrics
 
