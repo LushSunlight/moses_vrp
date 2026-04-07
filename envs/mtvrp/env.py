@@ -10,12 +10,21 @@ from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.utils.ops import gather_by_index, get_distance
 from rl4co.utils.pylogger import get_pylogger
 from tensordict.tensordict import TensorDict
-from torchrl.data import (
-    BoundedTensorSpec,
-    CompositeSpec,
-    UnboundedContinuousTensorSpec,
-    UnboundedDiscreteTensorSpec,
-)
+try:
+    from torchrl.data import (
+        BoundedTensorSpec,
+        CompositeSpec,
+        UnboundedContinuousTensorSpec,
+        UnboundedDiscreteTensorSpec,
+    )
+except ImportError:
+    # torchrl >= 0.11 renamed these spec classes.
+    from torchrl.data import Bounded, Composite, Unbounded
+
+    BoundedTensorSpec = Bounded
+    CompositeSpec = Composite
+    UnboundedContinuousTensorSpec = Unbounded
+    UnboundedDiscreteTensorSpec = Unbounded
 
 from .generator import MTVRPGenerator
 from .selectstartnodes import get_select_start_nodes_fn

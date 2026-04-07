@@ -49,6 +49,29 @@ VARIANT_GENERATION_PRESETS = {
     "ovrpbltw": {"O": 1.0, "TW": 1.0, "L": 1.0, "B": 1.0},
 }
 
+# Explicit class-level presets for training distributions that should only include
+# a specific subset of variants.
+VARIANT_CLASS_PRESETS = {
+    "mvmoe6": {
+        "cvrp": 1 / 6,
+        "vrptw": 1 / 6,
+        "vrpb": 1 / 6,
+        "vrpl": 1 / 6,
+        "ovrp": 1 / 6,
+        "ovrptw": 1 / 6,
+    }
+}
+
+CLASS_TO_FEATURES = {
+    "cvrp": (False, False, False, False),
+    "ovrp": (True, False, False, False),
+    "ovrptw": (True, True, False, False),
+    "vrpb": (False, False, False, True),
+    "vrpl": (False, False, True, False),
+    "vrptw": (False, True, False, False),
+    "vrpbltw": (False, True, True, True),
+}
+
 
 class MTVRPGenerator(Generator):
     """MTVRP Generator.
@@ -133,14 +156,24 @@ class MTVRPGenerator(Generator):
         self.max_time = max_time
         self.max_distance_limit = max_distance_limit
         self.speed = speed
+        self.class_variant_probs = None
 
         if variant_preset is not None:
             log.info(f"Using variant generation preset {variant_preset}")
-            variant_probs = VARIANT_GENERATION_PRESETS.get(variant_preset)
-            assert (
-                variant_probs is not None
-            ), f"Variant generation preset {variant_preset} not found. \
-                Available presets are {VARIANT_GENERATION_PRESETS.keys()} with probabilities {VARIANT_GENERATION_PRESETS.values()}"
+            if variant_preset in VARIANT_CLASS_PRESETS:
+                self.class_variant_probs = VARIANT_CLASS_PRESETS[variant_preset]
+                variant_probs = {
+                    "O": prob_open,
+                    "TW": prob_time_window,
+                    "L": prob_limit,
+                    "B": prob_backhaul,
+                }
+            else:
+                variant_probs = VARIANT_GENERATION_PRESETS.get(variant_preset)
+                assert (
+                    variant_probs is not None
+                ), f"Variant generation preset {variant_preset} not found. \
+                    Available presets are {VARIANT_GENERATION_PRESETS.keys()} and class presets are {VARIANT_CLASS_PRESETS.keys()}"
         else:
             variant_probs = {
                 "O": prob_open,
@@ -229,6 +262,23 @@ class MTVRPGenerator(Generator):
         thus, if prob high, it is less likely to remove the constraint (i.e. prob=0.9, 90% chance to keep constraint)
         """
         batch_size = td.batch_size[0]
+
+        if self.class_variant_probs is not None:
+            classes = list(self.class_variant_probs.keys())
+            probs = torch.tensor(list(self.class_variant_probs.values()), dtype=torch.float32)
+            indices = torch.distributions.Categorical(probs).sample((batch_size,))
+
+            keep_mask = torch.zeros((batch_size, 4), dtype=torch.bool)
+            for class_idx, class_name in enumerate(classes):
+                selected = indices == class_idx
+                if selected.any():
+                    keep_mask[selected] = torch.tensor(CLASS_TO_FEATURES[class_name], dtype=torch.bool)
+
+            td = self._default_open(td, ~keep_mask[:, 0])
+            td = self._default_time_window(td, ~keep_mask[:, 1])
+            td = self._default_distance_limit(td, ~keep_mask[:, 2])
+            td = self._default_backhaul(td, ~keep_mask[:, 3])
+            return td
 
         variant_probs = torch.tensor(list(self.variant_probs.values()))
 
