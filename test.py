@@ -5,7 +5,9 @@ import sys
 import time
 import warnings
 from collections import OrderedDict
+from typing import Union
 import torch
+import torch.serialization
 import torch.nn as nn
 
 from rl4co.data.transforms import StateAugmentation
@@ -16,6 +18,18 @@ from utils import get_dataloader
 from envs import MTVRPEnv
 from models import RouteFinderBase
 from models import RouteFinderPolicy, LoRAPolicy, MultiLoRAPolicy, CadaPolicy, CadaLoRAPolicy, CadaMultiLoRAPolicy
+import torchrl.data as torchrl_data
+import torchrl.data.tensor_specs as torchrl_tensor_specs
+
+CompositeSpec = getattr(torchrl_data, "CompositeSpec", getattr(torchrl_data, "Composite"))
+# Backward compatibility for checkpoints referencing old torchrl symbol path.
+if not hasattr(torchrl_tensor_specs, "CompositeSpec") and hasattr(
+    torchrl_tensor_specs, "Composite"
+):
+    setattr(torchrl_tensor_specs, "CompositeSpec", torchrl_tensor_specs.Composite)
+
+# Required for loading old checkpoints under PyTorch 2.6+ weights-only behavior.
+torch.serialization.add_safe_globals([CompositeSpec])
 
 
 # Tricks for faster inference
@@ -56,13 +70,15 @@ def test(
         num_augment=8,
         augment_fn="dihedral8",  # or symmetric. Default is dihedral8 for reported eval
         num_starts=None,
-        device="cuda",
+    decode_type="multistart_greedy",
+    temperature=1.0,
+        device: Union[str, torch.device] = "cuda",
 ):
     costs_bks = td.get("costs_bks", None)
 
     with torch.inference_mode():
         with (
-            torch.amp.autocast("cuda")
+            torch.autocast("cuda")
             if "cuda" in str(device)
             else torch.inference_mode()
         ):  # Use mixed precision if supported
@@ -72,7 +88,15 @@ def test(
                 td = StateAugmentation(num_augment=num_augment, augment_fn=augment_fn)(td)
 
             # Evaluate policy
-            out = policy(td, env, phase="test", num_starts=n_start, return_actions=True)
+            out = policy(
+                td,
+                env,
+                phase="test",
+                num_starts=n_start,
+                decode_type=decode_type,
+                temperature=temperature,
+                return_actions=True,
+            )
 
             # Unbatchify reward to [batch_size, num_augment, num_starts].
             reward = unbatchify(out["reward"], (num_augment, n_start))
@@ -200,6 +224,33 @@ if __name__ == "__main__":
     parser.add_argument('--lora_use_basis_variants_as_input', type=int, default=0)
     parser.add_argument('--lora_use_linear', type=int, default=0)
 
+    parser.add_argument(
+        '--decode_type',
+        type=str,
+        default='multistart_greedy',
+        choices=['greedy', 'sampling', 'multistart_greedy', 'multistart_sampling'],
+        help='Decoding strategy. Use multistart_sampling for multinomial sampling on feasible actions.',
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=1.0,
+        help='Softmax temperature used by decoding strategy.',
+    )
+    parser.add_argument(
+        '--rollout_times',
+        type=int,
+        default=1,
+        help='Number of independent decoding rollouts per batch (use >1 with sampling).',
+    )
+    parser.add_argument(
+        '--report_rollout_steps',
+        type=int,
+        nargs='*',
+        default=None,
+        help='Milestone rollout indices to report in a single run, e.g. --report_rollout_steps 20 75 150 300',
+    )
+
 
 
     # Use load_from_checkpoint with map_location, which is handled internally by Lightning
@@ -213,6 +264,12 @@ if __name__ == "__main__":
     opts.lora_use_basis_variants = bool(opts.lora_use_basis_variants)
     opts.lora_use_basis_variants_as_input = bool(opts.lora_use_basis_variants_as_input)
     opts.lora_use_linear = bool(opts.lora_use_linear)
+    assert opts.rollout_times >= 1, "rollout_times must be >= 1"
+    assert opts.temperature > 0, "temperature must be > 0"
+    report_steps = opts.report_rollout_steps if opts.report_rollout_steps is not None else [opts.rollout_times]
+    report_steps = sorted(set(int(x) for x in report_steps if x > 0 and x <= opts.rollout_times))
+    if len(report_steps) == 0:
+        report_steps = [opts.rollout_times]
 
     log_file_name = f"test_{opts.size}_{opts.model_name}_{time.strftime('%Y%m%d-%H%M%S', time.localtime())}.txt"
     os.makedirs(opts.log_path, exist_ok=True)
@@ -357,24 +414,59 @@ if __name__ == "__main__":
     results = {}
     for dataset in data_paths:
         print("\n")
+        dataset_name = dataset.split("/")[-3].split(".")[0].upper()
 
         td_test = env.load_data(dataset)  # this also adds the bks cost
         dataloader = get_dataloader(td_test, batch_size=opts.batch_size)
 
         start = time.time()
-        res = []
-        for batch in dataloader:
-            td_test = env.reset(batch).to(device)
-            o = test(policy, td_test, env, device=device)
-            res.append(o)
-        
-        out = {}
-        out["max_aug_reward"] = torch.cat([o["max_aug_reward"] for o in res])
-        out["gap_to_bks"] = torch.cat([o["gap_to_bks"] for o in res])
+        best_reward = None
+        best_gap = None
+        milestone_results = {}
+        for rollout_idx in range(1, opts.rollout_times + 1):
+            res = []
+            for batch in dataloader:
+                td_test = env.reset(batch).to(device)
+                o = test(
+                    policy,
+                    td_test,
+                    env,
+                    decode_type=opts.decode_type,
+                    temperature=opts.temperature,
+                    device=device,
+                )
+                res.append(o)
+
+            current_reward = torch.cat([o["max_aug_reward"] for o in res])
+            current_gap = torch.cat([o["gap_to_bks"] for o in res])
+
+            if best_reward is None:
+                best_reward = current_reward
+                best_gap = current_gap
+            else:
+                assert best_gap is not None
+                improved_mask = current_reward > best_reward
+                best_reward = torch.where(improved_mask, current_reward, best_reward)
+                best_gap = torch.where(improved_mask, current_gap, best_gap)
+
+            if rollout_idx in report_steps:
+                milestone_cost = -best_reward.mean().item()
+                milestone_gap = best_gap.mean().item()
+                milestone_results[rollout_idx] = {
+                    "cost": milestone_cost,
+                    "gap": milestone_gap,
+                }
+                print(
+                    f"{dataset_name} | Rollout@{rollout_idx} | Cost: {milestone_cost:.3f} | Gap: {milestone_gap:.3f}%"
+                )
+
+        assert best_reward is not None and best_gap is not None
+        out = {
+            "max_aug_reward": best_reward,
+            "gap_to_bks": best_gap,
+        }
 
         inference_time = time.time() - start
-
-        dataset_name = dataset.split("/")[-3].split(".")[0].upper()
         print(
             f"{dataset_name} | Cost: {-out['max_aug_reward'].mean().item():.3f} | Gap: {out['gap_to_bks'].mean().item():.3f}% | Inference time: {inference_time:.3f} s"
         )
@@ -384,6 +476,7 @@ if __name__ == "__main__":
         results[dataset_name]["cost"] = -out["max_aug_reward"].mean().item()
         results[dataset_name]["gap"] = out["gap_to_bks"].mean().item()
         results[dataset_name]["inference_time"] = inference_time
+        results[dataset_name]["rollout_snapshots"] = milestone_results
 
 
     if opts.save_results:
